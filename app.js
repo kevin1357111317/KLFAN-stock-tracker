@@ -250,63 +250,53 @@
     return { stocks: stocks, txs: txs };
   }
 
-  /* ---------- live quotes (Google Sheet + GOOGLEFINANCE, via the viewer's own
-     Google Drive connector — no API key ever lives in this page) ---------- */
-  var QUOTE_FILE_ID = "1ns4IMViBeJkfRBxeWM9n3vwNnu26LkwcBh64DfiuNx0";
-  var QUOTE_SERVER = "Google Drive";
-  var QUOTE_TOOL = "download_file_content";
-  var QUOTE_INPUT = { fileId: QUOTE_FILE_ID, exportMimeType: "text/csv" };
+  /* ---------- live quotes (Fugle + Twelve Data, via Supabase) ----------
+     The page can't fetch anything itself — the Artifact CSP blocks every
+     external domain — so it never talks to a quote API. A Supabase Edge
+     Function does the fetching and parks the result in klfan_quotes; this
+     page just reads that table over the same execute_sql path the ledger
+     uses, and triggers a refresh by calling refresh_klfan_quotes(). The
+     API keys stay in the function's secrets and never reach the browser.
+
+     Only currently-held symbols are quoted: an exited position is worth 0
+     whatever the price, and Twelve Data's free tier bills per symbol. */
+
+  var QUOTES_SQL =
+    "select coalesce(json_agg(json_build_array(symbol,price,currency,source,quoted_at," +
+    "extract(epoch from updated_at)*1000) order by symbol),'[]'::json) as d from klfan_quotes";
+  var REFRESH_SQL = "select refresh_klfan_quotes() as d";
+
+  // Re-opening the page refreshes, but a reload loop shouldn't burn API
+  // credits — anything fetched within this window is treated as current.
+  var QUOTE_FRESH_MS = 60000;
 
   var live = {
     available: null,   // null = still resolving, false = no connector path
-    prices: null,      // { symbol: number }
+    prices: null,      // { symbol: { price, currency } }
     fx: null,
-    sheetTime: null,   // NOW() stamp from the sheet
-    fetchedAt: null,   // when this result was produced
+    fetchedAt: null,   // when the Edge Function last wrote these rows
+    sources: null,     // { fugle: n, twelve_data: n }
     status: null,      // { code, message } for a degraded state
     busy: false
   };
-  // mcpCap is declared once, up in the database section — both the database and
+  // mcpCap is declared once, up in the database section — both the ledger and
   // the quote feed share the same resolved capability.
 
-  function b64ToText(b64) {
-    var bin = atob(String(b64).replace(/\s/g, ""));
-    var bytes = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    try { return new TextDecoder("utf-8").decode(bytes); } catch (e) { return bin; }
-  }
-
-  function parseQuoteResult(result) {
-    var p = result && result.payload;
-    if (typeof p === "string") { try { p = JSON.parse(p); } catch (e) { return null; } }
-    if (!p || !p.content) return null;
-    var text = b64ToText(p.content);
-    var prices = {}, fx = null, stamp = null;
-    text.split(/\r?\n/).forEach(function (line, i) {
-      if (!line || i === 0) return;
-      var idx = line.indexOf(",");
-      if (idx < 0) return;
-      var sym = line.slice(0, idx).trim();
-      var raw = line.slice(idx + 1).trim().replace(/^"|"$/g, "");
-      if (sym === "_UPDATED") { stamp = raw; return; }
-      if (raw === "") return;
-      var v = parseFloat(raw.replace(/,/g, ""));
-      if (isNaN(v)) return;
-      if (sym === "CURRENCY:USDTWD") fx = v; else prices[sym] = v;
+  function applyQuoteRows(list) {
+    // 各來源的 quoted_at 意義不同（台股是今天收盤，美股是前一交易日收盤），
+    // 湊成單一「報價時間」只會誤導，所以只用抓取時間。
+    var prices = {}, fx = null, sources = {}, newest = 0;
+    (list || []).forEach(function (r) {
+      var sym = r[0], price = Number(r[1]), cur = r[2], src = r[3], upd = Number(r[5]);
+      if (!isFinite(price)) return;
+      if (sym === "USD/TWD") { fx = price; }
+      else { prices[sym] = { price: price, currency: cur }; sources[src] = (sources[src] || 0) + 1; }
+      if (isFinite(upd) && upd > newest) newest = upd;
     });
-    return { prices: prices, fx: fx, stamp: stamp };
-  }
-
-  function applyQuote(result) {
-    var q = parseQuoteResult(result);
-    if (!q) {
-      live.status = { code: "parse", message: "報價表格式看不懂，可能被改過了" };
-      return;
-    }
-    live.prices = q.prices;
-    live.fx = q.fx;
-    live.sheetTime = q.stamp;
-    live.fetchedAt = result && result.cache && result.cache.storedAt ? result.cache.storedAt : Date.now();
+    live.prices = prices;
+    live.fx = fx;
+    live.sources = sources;
+    live.fetchedAt = newest || Date.now();
     live.status = null;
     live.available = true;
   }
@@ -315,11 +305,11 @@
   function quoteErrorCopy(code, message) {
     switch (code) {
       case "needs_reauth":
-        return "Google Drive 授權過期了：到 claude.ai 設定 → 連接器 重新連接後即可恢復即時報價。";
+        return "Supabase 授權過期了：到 claude.ai 設定 → 連接器 重新連接後即可恢復報價。";
       case "server_not_connected":
-        return "找不到 Google Drive 連接器：到 claude.ai 設定 → 連接器 加入 Google Drive。";
+        return "找不到 Supabase 連接器：到 claude.ai 設定 → 連接器 加入 Supabase。";
       case "selection_required":
-        return "你有多個 Google Drive 連接器，請先在提示中選擇要用哪一個。";
+        return "你有多個 Supabase 連接器，請先在提示中選擇要用哪一個。";
       case "blocked_by_policy":
         return "組織政策擋下了這個連接器呼叫，改用下方手動價格。";
       case "approval_required":
@@ -328,14 +318,21 @@
         return "這個頁面沒有取得呼叫該工具的授權。";
       case "server_not_found":
         return "報價來源的連接器已不存在。";
+      // 下面兩個是抓取端自己回報的，不是連接器的問題。
+      case "fugle_down":
+        return "Fugle 抓不到台股報價" + (message ? "（" + message + "）" : "") + "，改用上次的價格。";
+      case "twelve_quota":
+        return "Twelve Data 額度用完了" + (message ? "：" + message : "") + "，美股改用上次的價格。";
+      case "partial":
+        return message || "部分標的沒抓到報價，那幾檔改用下方手動價格。";
       case "tool_error":
-        return "讀報價表失敗：" + (message || "試算表可能被刪除或改名了");
+        return "更新報價失敗：" + (message || "資料庫回報錯誤");
       case "server_unavailable":
       case "rate_limited":
       case "upstream_error":
-        return "暫時連不到 Google Drive";
+        return "暫時連不到 Supabase";
       default:
-        return "即時報價目前不可用，改用下方手動價格。";
+        return "報價目前不可用，改用下方手動價格。";
     }
   }
 
@@ -351,11 +348,12 @@
     render();
   }
 
-  function startQuoteWatch(m) {
-    m.watchTool(QUOTE_SERVER, QUOTE_TOOL, QUOTE_INPUT, function (ev) {
-      if (ev.type === "data") { applyQuote(ev.result); render(); }
-      else handleQuoteError(ev.error);
-    }, { cache: { staleTime: 60000 }, refetchInterval: 300000 });
+  // Read whatever the last refresh left in the table. Cheap, and it means a
+  // failed refresh still shows the previous prices instead of nothing.
+  function loadQuotes() {
+    return sql(QUOTES_SQL)
+      .then(function (rows) { applyQuoteRows(firstCell(rows)); })
+      .catch(function (e) { handleQuoteError(e); });
   }
 
   // One capability resolution drives both the database and the quote feed.
@@ -380,25 +378,50 @@
       mcpCap = m;
       live.available = null;
       db.available = true;
-      startQuoteWatch(m);
       loadFromDb(false);
+      // 開啟時更新一次 —— 但若上一次抓取還很新就不重抓，避免重整頁面
+      // 就白白吃掉 Twelve Data 的額度。
+      loadQuotes().then(function () {
+        if (!live.fetchedAt || Date.now() - live.fetchedAt > QUOTE_FRESH_MS) refreshQuotes();
+        else render();
+      });
     }).catch(function () { offline(); });
   }
 
+  // refresh_klfan_quotes() 同步跑完抓取才回來，所以按一次就拿得到結果 ——
+  // 發請求的是資料庫而不是這個頁面，CSP 管不到。
   function refreshQuotes() {
     if (!mcpCap || live.busy) return;
     live.busy = true;
     render();
-    mcpCap.callTool(QUOTE_SERVER, QUOTE_TOOL, QUOTE_INPUT, { cache: { refresh: true } })
-      .then(function (r) { applyQuote(r); })
+    sql(REFRESH_SQL)
+      .then(function (rows) {
+        var r = firstCell(rows) || {};
+        return loadQuotes().then(function () {
+          // 抓取本身的失敗與連接器的失敗要分開講，使用者的處置方式不同。
+          if (r.error) live.status = { code: "tool_error", message: r.detail || r.error };
+          else if (r.failed > 0) {
+            var names = (r.failures || []).map(function (f) { return f.symbol; }).join("、");
+            live.status = {
+              code: r.twelveDetail ? "twelve_quota" : "partial",
+              message: r.twelveDetail || (names + " 沒抓到報價")
+            };
+          }
+        });
+      })
       .catch(function (e) { handleQuoteError(e); })
       .then(function () { live.busy = false; render(); });
   }
 
+  // 幣別不符就不採用即時價。資料庫裡確實有 market/currency 標錯的列
+  // （例如 currency='TWD' 但 symbol='NASDAQ:AMSC'），拿美元價格當台幣用
+  // 會算出一個沒有任何提示的錯誤市值 —— 寧可退回手動價格。
   function livePriceFor(s) {
     if (!live.prices || !s.symbol) return null;
-    var v = live.prices[s.symbol];
-    return typeof v === "number" ? v : null;
+    var q = live.prices[s.symbol];
+    if (!q || typeof q.price !== "number") return null;
+    if (q.currency && s.currency && q.currency !== s.currency) return null;
+    return q.price;
   }
 
   function effectivePrice(s) {
@@ -548,8 +571,8 @@
      Cash flows arrive from SQL already converted at the rate of their own trade
      date (klfan_fx_daily, the same daily series the sheet's XLOOKUP used), so
      JS never converts a historical amount. Only *today's* unrealized market
-     value uses the live rate — exactly as the sheet uses GOOGLEFINANCE for
-     目前市值 but not for 累計淨投入/XIRR. */
+     value uses the live rate — the historical/live split the original sheet
+     drew between 目前市值 and 累計淨投入/XIRR. */
   function txTwd(t, s) {
     if (typeof t.twd === "number" && isFinite(t.twd)) return t.twd;
     // a row added in this session before a reload: value it at the live rate
@@ -696,7 +719,8 @@
         "<p>交易資料存在你自己的 Supabase（klfan_stocks／klfan_transactions／klfan_fx_daily），" +
         "原始資料匯入自 Google Sheet「KLFAN_管理」（2026/09/01）。" +
         "在這裡新增或刪除會直接寫進資料庫，但不會回寫 Google Sheet。" +
-        "即時報價來自「KLFAN_即時報價」試算表的 GOOGLEFINANCE。</p>" +
+        "報價由 Supabase Edge Function 抓取後存進 klfan_quotes：" +
+        "台股來自 Fugle，美股與匯率來自 Twelve Data，只抓仍持有的標的。</p>" +
       "</footer>"
     );
   }
@@ -742,11 +766,16 @@
     if (!count) {
       return '<section class="livebar pending"><span class="dot"></span><span class="livetext">報價載入中…</span>' + btn + "</section>";
     }
-    var when = live.sheetTime ? escapeHtml(live.sheetTime) : new Date(live.fetchedAt).toLocaleString("zh-TW");
+    var when = live.fetchedAt ? new Date(live.fetchedAt).toLocaleString("zh-TW") : "—";
+    var src = live.sources || {};
+    var srcText = [];
+    if (src.fugle) srcText.push("台股 " + src.fugle + " 檔 Fugle");
+    if (src.twelve_data) srcText.push("美股 " + src.twelve_data + " 檔 Twelve Data");
     return (
       '<section class="livebar ok"><span class="dot"></span>' +
-        '<span class="livetext">即時報價 ' + count + " 檔｜USD/TWD " +
-        (live.fx ? live.fx.toFixed(4) : "—") + "｜報價時間 " + when + "</span>" + btn +
+        '<span class="livetext">' + (srcText.join("／") || "報價 " + count + " 檔") +
+        "｜USD/TWD " + (live.fx ? live.fx.toFixed(4) : "—") +
+        "｜更新於 " + escapeHtml(when) + "</span>" + btn +
       "</section>"
     );
   }

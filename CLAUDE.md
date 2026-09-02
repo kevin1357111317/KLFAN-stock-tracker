@@ -25,7 +25,8 @@ Kevin 的個人投資組合追蹤 App。輸入是他從 2019 年至今的完整�
 | 資源 | 識別碼 |
 |---|---|
 | Supabase 專案 | `gbxsnwqbjmgfikpblyot`（ap-northeast-1, PG17） |
-| 即時報價試算表 | `1ns4IMViBeJkfRBxeWM9n3vwNnu26LkwcBh64DfiuNx0`（KLFAN_即時報價） |
+| 報價 Edge Function | `refresh-klfan-quotes`（Fugle + Twelve Data → `klfan_quotes`） |
+| 舊的報價試算表 | `1ns4IMViBeJkfRBxeWM9n3vwNnu26LkwcBh64DfiuNx0`（KLFAN_即時報價，**已不再使用**） |
 | 原始資料試算表 | `1Qqz2uXBhUsKQGrzxMaZfdTOrDL8dr_Ro9eXV71uyyZk`（KLFAN_管理） |
 | 已發布頁面 | Artifact `b6b9ec65-f527-410a-b026-4a13c8d42571` |
 
@@ -40,6 +41,8 @@ Kevin 的個人投資組合追蹤 App。輸入是他從 2019 年至今的完整�
 | `build.py` | `python3 build.py` → 產生 `klfan_app.html` |
 | `klfan_app.html` | 建置產物（發布用，是「片段」格式，無 doctype） |
 | `klfan_app_full.html` | 建置產物（本機預覽用，有完整外層） |
+| `supabase/functions/refresh-klfan-quotes/` | 報價 Edge Function 原始碼 |
+| `supabase/migrations/*.sql` | 報價那一套的 schema（表、view、觸發用的函式） |
 
 改 `app.js` / `app.css` → 跑 `build.py` → 重新發布 `klfan_app.html`。
 
@@ -53,6 +56,9 @@ klfan_stocks       (key PK, display, market '台股'|'美股', currency 'TWD'|'U
 klfan_transactions (id PK, stock_key FK→klfan_stocks, tx_date, amount, shares,
                     bank, kind 'trade'|'dividend', note)
 klfan_fx_daily     (fx_date PK, rate)     -- USD/TWD 每日收盤
+klfan_quotes       (symbol PK, price, currency, change, change_percent,
+                    source 'fugle'|'twelve_data', quoted_at, updated_at)
+klfan_live_symbols (view) -- 仍持有的 symbol，報價只抓這些
 ```
 
 三張表都 **enable RLS 且沒有任何 policy**。目前只透過 MCP 連接器的管理 API 存取，
@@ -94,7 +100,7 @@ klfan_fx_daily     (fx_date PK, rate)     -- USD/TWD 每日收盤
 | 用途 | 用哪個匯率 | 在哪裡算 |
 |---|---|---|
 | 歷史買賣／股息換算台幣 | **該筆交易當日**匯率（查 `klfan_fx_daily`） | **SQL 端** |
-| 目前市值換算台幣 | **即時匯率**（GOOGLEFINANCE） | JS 端 |
+| 目前市值換算台幣 | **即時匯率**（Twelve Data，存在 `klfan_quotes` 的 `USD/TWD` 那一列） | JS 端 |
 
 交易資料從 SQL 回來時，每筆已經附帶換算好的 `tw` 欄位，JS 不再做歷史換算。
 
@@ -123,37 +129,75 @@ VOO 23.9%、台積電 27.5%、聯發科 58.7%、QQQ 30.0%、SOXX 37.4%、DRAM 26
 ```
 capabilities: {
   mcp: { servers: [
-    { server: "Supabase",     tools: ["execute_sql"] },
-    { server: "Google Drive", tools: ["download_file_content"] }
+    { server: "Supabase", tools: ["execute_sql"] }
   ]}
 }
 ```
 
+> 2026/09/02 起**不再需要 Google Drive 連接器** —— 報價改由 Supabase 端抓取，
+> 頁面只剩 `execute_sql` 這一條路。重新發布時記得把 Google Drive 從 capabilities 拿掉。
+
 ### Artifact 的硬限制
 
 1. **不能對任何外部網域發 fetch/XHR**（CSP）。
-   這就是為什麼報價要繞 Google 試算表，而不能直接打 Fugle 或任何行情 API。
+   頁面因此永遠不可能自己打 Fugle。解法是讓**資料庫**去發請求（見「即時報價」），
+   而不是讓頁面發 —— CSP 管的是瀏覽器。
 2. **連接器回應有大小上限。** 一次回 135KB 會被截斷 → JSON 解析失敗。
    交易資料因此改成每頁 400 筆分頁載入（每頁約 26KB）。
 3. 頁面自己不能存資料，所有寫入都要走 Supabase。
 
 ---
 
-## 即時報價
+## 即時報價（2026/09/02 改版，已不用 Google 試算表）
 
-Google 試算表「KLFAN_即時報價」，兩欄 `symbol,price`，每列一個 GOOGLEFINANCE 公式，
-外加 `CURRENCY:USDTWD`（即時匯率）與 `_UPDATED`（時間戳）。
+```
+頁面 ──execute_sql──▶ refresh_klfan_quotes()  ← Postgres，http 擴充，同步
+                            │
+                            ▼  POST /functions/v1/refresh-klfan-quotes
+                      Edge Function
+                            ├──▶ Fugle        intraday/quote/{code}   台股
+                            ├──▶ Twelve Data  quote?symbol=a,b,c      美股（批次）
+                            └──▶ Twelve Data  exchange_rate USD/TWD
+                            │
+                            ▼  service_role 寫入
+                      klfan_quotes ──execute_sql──▶ 頁面讀
+```
 
-App 用 `download_file_content`（`exportMimeType: text/csv`）讀取後 base64 解碼解析。
+**為什麼要繞這麼一圈**：Artifact 的 CSP 擋死頁面的所有對外 fetch，所以頁面永遠
+不可能自己打 Fugle。但頁面可以執行 SQL，而**發請求的是資料庫不是瀏覽器** ——
+這條路 CSP 管不到。金鑰全留在 Edge Function 的 secret 裡，頁面原始碼依然沒有任何金鑰。
 
-> **`read_file_content` 對這張表會回空白**（公式格的計算值讀不到），
-> 一定要用 `download_file_content` 匯出 CSV。
+**更新時機**：開啟頁面時更新一次（上次抓取在 60 秒內則略過），或按「重新整理」。
+沒有排程，`pg_cron` 沒有用在這裡。
 
-代碼對應的坑：
-- 台股要加 `TPE:` 前綴（`TPE:2330`、`TPE:0050`）
-- `DRAM` 必須是 **`BATS:DRAM`**；裸寫 `DRAM` 會抓到歐洲一檔完全不同的 ETF（價差十倍）
-- `MUU` / `MVLL` / `SPCX` 不加前綴才抓得到
-- **新增標的後要把 symbol 加進這張試算表**，否則沒有即時價
+### 只抓仍持有的標的（重要，不要「修正」成全抓）
+
+`klfan_live_symbols` 這個 view 只列出 `sum(shares) > 0` 的標的。理由有兩層：
+
+1. 已出清的標的持股為 0，市值恆為 0，抓它的價格**不會改變畫面上任何數字**。
+2. Twelve Data 免費方案是**每分鐘 8 credits、一檔算一個**。39 檔全抓會直接回 429
+   （實測過，訊息是 *"19 API credits were used, with the current limit being 8"*）。
+   篩到實際持有之後是 4 檔美股 + 1 次匯率 = 5，穩穩在額度內。
+
+Fugle 沒有這個壓力（實測 20 檔全過），但一併篩掉比較快也比較省。
+
+### 代碼正規化
+
+`klfan_stocks.symbol` 仍然沿用 GOOGLEFINANCE 格式（`TPE:2330`、`NASDAQ:AAPL`、
+`BATS:DRAM`）。Edge Function 送出前把交易所前綴剝掉，但寫回 `klfan_quotes` 時
+**用原始 symbol 當 key**，所以頁面完全不需要知道正規化規則。
+
+**路由看的是代碼前綴，不是 `market` 欄位** —— 資料庫裡確實有 `market='台股'` 但
+`symbol='NASDAQ:AMSC'` 的列（見「已知的坑」），照前綴走才會抓到對的價格。
+
+- `TPE:` / `TWO:` → Fugle（送出 `2330`、`00631L`）
+- 其餘一律 → Twelve Data（送出 `AAPL`、`DRAM`、`VOO`）
+
+Twelve Data 帶 `country=United States`，避免 `DRAM` 抓到同名的歐洲 ETF。
+
+### 新增標的
+
+只要 `klfan_stocks.symbol` 填對前綴就會自動被抓，**不再需要去維護任何試算表**。
 
 ---
 
@@ -167,11 +211,24 @@ App 用 `download_file_content`（`exportMimeType: text/csv`）讀取後 base64 
 2. **不要從各個股工作表分別抓資料。** 我一開始這樣做，發現有幾張表混入了多餘的列，
    加總對不上。正確來源是「股票總表」工作表（它自己就是全部個股的彙整）。
 
-3. `0050` 這類代號在 CSV 匯入 Google 試算表時前導零會被吃掉（變成 `50`），
-   所以報價表用 `symbol` 當 key，不用代號。
+3. ~~`0050` 前導零在 Google 試算表會被吃掉~~ —— 已解決。報價不再經過試算表，
+   Fugle 直接吃 `0050` / `00631L`，實測正常。
 
-4. Fugle API：Kevin 有金鑰，但 Artifact 的 CSP 擋死了，Cowork 沙箱的對外連線也不通。
-   **離開 Artifact 之後（例如搬到 Vercel）就可行了。**
+4. ~~Fugle 被 CSP 擋死~~ —— 已解決（2026/09/02），走 Postgres → Edge Function。
+   但**沙箱的對外連線仍然不通**：在 Cowork/Claude Code 裡無法直接測 Fugle 或
+   Twelve Data，只能透過部署好的 Edge Function 間接驗證。
+
+5. **`AMSC` 的 market／currency 標錯了。** 它是 `market='台股'`、`currency='TWD'`，
+   但 `symbol='NASDAQ:AMSC'`，實際是美股。影響：
+   - 它的交易金額被當成台幣計入「台股淨投入」（目前的驗證基準數字**就是這樣算出來的**，
+     所以改這一列會讓那三個基準跟著變 —— 要改的話記得同步更新基準）。
+   - 報價路由看前綴，所以會正確地去 Twelve Data 抓 USD 價格；但頁面發現
+     幣別不符（USD vs TWD）會**拒絕採用**，退回手動價格。這是刻意的，
+     見 `app.js` 的 `livePriceFor()`。
+   目前它已出清（持股 0），所以市值影響為零，還沒動它。
+
+6. **Twelve Data 免費方案每分鐘只有 8 credits，一檔算一個。**
+   不要「順手」把報價改成全部標的都抓，會立刻 429。
 
 ---
 
@@ -185,6 +242,7 @@ App 用 `download_file_content`（`exportMimeType: text/csv`）讀取後 base64 
 
 1. 資料層：`execute_sql` 經連接器 → 改成 Supabase JS client + anon key，
    並為三張表補 RLS policy。
-2. 報價層：讀 Google 試算表 → 可以直接打 Fugle（CSP 限制消失了）。
+2. 報價層：可以拿掉 Postgres 那一跳，前端直接 `sb.functions.invoke('refresh-klfan-quotes')`
+   （ks-wealth 就是這樣做的，可以照抄）。Edge Function 本身完全不用改。
 3. 這時候 `app.js` 的 UI 與計算邏輯可以整段沿用，只需要換掉資料存取那一層
-   （集中在 `sql()` / `loadFromDb()` / `mutate()` 三個函式，以及 `initLive` 那段報價）。
+   （集中在 `sql()` / `loadFromDb()` / `mutate()`，以及 `loadQuotes()` / `refreshQuotes()`）。

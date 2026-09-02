@@ -4,8 +4,8 @@
 **年化報酬率（XIRR）**、損益與完整進出明細，台股／美股分開統計，可以隨時新增
 買賣並自動重算。
 
-無框架、無相依套件的單頁 App，資料存在 Supabase，即時股價與匯率透過 Google
-試算表的 `GOOGLEFINANCE` 取得。
+無框架、無相依套件的單頁 App，資料存在 Supabase。台股報價來自 **Fugle**、
+美股與匯率來自 **Twelve Data**，由 Supabase Edge Function 抓取後存進資料庫。
 
 > 交接與維護細節（資料庫 schema、金額符號約定、核心算法、驗證基準、已知的坑）
 > 都寫在 [`CLAUDE.md`](CLAUDE.md)。**動手改任何計算邏輯前先讀它。**
@@ -32,12 +32,16 @@ python3 build.py
 | `app.js` | 全部邏輯：XIRR、資料庫存取、報價、UI 渲染。約 1,100 行 |
 | `app.css` | 樣式，含深色模式 |
 | `build.py` | 把 css + js 組成單一 HTML |
+| `supabase/functions/refresh-klfan-quotes/` | 報價 Edge Function（Fugle + Twelve Data） |
+| `supabase/migrations/` | 報價那一套的 schema |
 | `CLAUDE.md` | 專案交接文件 |
 
 ## 資料來源
 
 - **Supabase**：`klfan_stocks`（標的）、`klfan_transactions`（交易）、`klfan_fx_daily`（USD/TWD 每日收盤）
-- **即時報價**：Google 試算表「KLFAN_即時報價」，每列一個 `GOOGLEFINANCE` 公式
+- **報價**：`klfan_quotes`，由 `refresh-klfan-quotes` Edge Function 寫入
+  （台股 Fugle、美股與匯率 Twelve Data），只抓仍持有的標的
 
-頁面本身不含任何金鑰——透過 Claude Artifact 的 `mcp` capability 呼叫使用者自己的
-連接器存取 Supabase 與 Google Drive。
+頁面本身不含任何金鑰。Artifact 的 CSP 擋死所有對外 fetch，所以頁面不直接打行情 API：
+它透過 `mcp` capability 用使用者自己的 Supabase 連接器執行 SQL，由**資料庫**去呼叫
+Edge Function —— 行情商的金鑰全留在 Edge Function 的 secret 裡。
