@@ -127,7 +127,11 @@
     "coalesce(json_agg(json_build_array(symbol,price,currency,source,quoted_at," +
     "extract(epoch from updated_at)*1000) order by symbol),'[]'::json)";
 
-  // 標的 1.9KB、報價 0.8KB，兩份都很小又一定一起要 —— 合併成一次往返。
+  // 開啟所需的全部資料一次拿完。每趟往返實測約 3 秒的固定成本，跟資料多寡
+  // 幾乎無關，所以「少一趟」遠比「少幾十 KB」有價值。
+  // klfan_bootstrap() 用字典編碼把重複字串換成索引，1,484 筆從 128.6KB
+  // 壓到 93KB，塞得進單次回應而且沒有少任何欄位。
+  var BOOTSTRAP_SQL = "select klfan_bootstrap() as d";
   var INIT_SQL =
     "select (select " + STOCKS_JSON + " from klfan_stocks) as s," +
     " (select " + QUOTES_JSON + " from klfan_quotes) as q";
@@ -160,6 +164,24 @@
       };
     });
     return stocks;
+  }
+
+  // klfan_bootstrap() 的交易列是字典編碼的：
+  // [id, 標的索引, 日期, 金額, 股數, 銀行索引, 類型索引, 備註索引, 台幣]
+  // 解回跟分頁版一模一樣的形狀，後面的程式碼都不用知道有這回事。
+  function applyBootstrapTx(stocks, keys, dict, list) {
+    var banks = (dict && dict.banks) || [];
+    var notes = (dict && dict.notes) || [];
+    var kinds = (dict && dict.kinds) || [];
+    (list || []).forEach(function (r) {
+      var s = stocks[keys[r[1]]];
+      if (!s) return;
+      s.transactions.push({
+        id: r[0], date: r[2], amount: Number(r[3]), shares: Number(r[4]),
+        bank: banks[r[5]] || "", kind: kinds[r[6]], note: notes[r[7]] || "",
+        twd: Number(r[8])
+      });
+    });
   }
 
   function applyTxPage(stocks, list) {
@@ -223,30 +245,45 @@
     }
   }
 
+  // 單次回應塞不下時的退路：照舊分頁把交易讀完。
+  function loadTxPaged(staged) {
+    function nextPage(offset) {
+      return sql(txPageSql(offset), "交易 " + (offset + 1) + "–").then(function (r2) {
+        var page = firstCell(r2) || [];
+        applyTxPage(staged, page);
+        db.progress = offset + page.length;
+        render();
+        if (page.length === PAGE) return nextPage(offset + PAGE);
+      });
+    }
+    return nextPage(0);
+  }
+
   function loadFromDb(isRetry) {
     db.loading = true;
     db.progress = 0;
     render();
-    var staged = null;
     perfReset();
-    return sql(INIT_SQL, "標的+報價").then(function (rows) {
-      var row = rows && rows[0];
-      if (!row || !row.s) throw { code: "bad_response", message: "查無標的" };
-      staged = buildStocks(row.s);
-      applyQuoteRows(row.q);   // 報價順道一起回來，省一趟往返
-      // 分頁讀，讀進 staged；畫面上仍是舊資料（快取或上次載入的），
-      // 全部到齊才換上去。
-      function nextPage(offset) {
-        return sql(txPageSql(offset), "交易 " + (offset + 1) + "–").then(function (r2) {
-          var page = firstCell(r2) || [];
-          applyTxPage(staged, page);
-          db.progress = offset + page.length;
-          render();
-          if (page.length === PAGE) return nextPage(offset + PAGE);
+    return sql(BOOTSTRAP_SQL, "全部資料").then(function (rows) {
+      var d = firstCell(rows);
+      if (!d || !d.s) throw { code: "bad_response", message: "查無標的" };
+      var staged = buildStocks(d.s);
+      var keys = d.s.map(function (r) { return r[0]; });
+      applyBootstrapTx(staged, keys, d.d, d.t);
+      db.progress = (d.t || []).length;
+
+      // 回應被截斷的話 t 會少於 n。與其顯示一份殘缺的帳本，不如退回分頁載入
+      // —— 交易量長大到單次塞不下時，這條路會自動接手。
+      if (d.n && (d.t || []).length < d.n) {
+        staged = buildStocks(d.s);
+        return loadTxPaged(staged).then(function () {
+          applyQuoteRows(d.q);
+          return staged;
         });
       }
-      return nextPage(0);
-    }).then(function () {
+      applyQuoteRows(d.q);
+      return staged;
+    }).then(function (staged) {
       state.stocks = staged;
       cacheWrite(exportForCache());
       db.status = null;
@@ -473,7 +510,9 @@
     sql(REFRESH_SQL, "報價更新")
       .then(function (rows) {
         var r = firstCell(rows) || {};
-        return loadQuotes().then(function () {
+        // 更新函式已經把新報價一起帶回來了，不必再發一次查詢讀它。
+        var applied = r.quotes ? (applyQuoteRows(r.quotes), Promise.resolve()) : loadQuotes();
+        return Promise.resolve(applied).then(function () {
           // 抓取本身的失敗與連接器的失敗要分開講，使用者的處置方式不同。
           if (r.error) live.status = { code: "tool_error", message: r.detail || r.error };
           else if (r.failed > 0) {
