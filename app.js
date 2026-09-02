@@ -167,7 +167,7 @@
       case "upstream_error":
         return "暫時連不到資料庫";
       case "bad_response":
-        return "資料庫回應格式看不懂";
+        return "資料庫回應格式看不懂" + (message ? "（" + message + "）" : "");
       default:
         return "資料庫目前不可用";
     }
@@ -378,13 +378,17 @@
       mcpCap = m;
       live.available = null;
       db.available = true;
-      loadFromDb(false);
-      // 開啟時更新一次 —— 但若上一次抓取還很新就不重抓，避免重整頁面
-      // 就白白吃掉 Twelve Data 的額度。
-      loadQuotes().then(function () {
-        if (!live.fetchedAt || Date.now() - live.fetchedAt > QUOTE_FRESH_MS) refreshQuotes();
-        else render();
-      });
+      // 一次只發一個 execute_sql。帳本與報價現在都走 Supabase，同時發出去
+      // 會讓回應對不上請求，解析直接失敗（報價原本走 Google Drive，是不同的
+      // 連接器，所以以前不會有這個問題）。
+      loadFromDb(false)
+        .then(function () { return loadQuotes(); })
+        .then(function () {
+          // 開啟時更新一次 —— 但若上一次抓取還很新就不重抓，避免重整頁面
+          // 就白白吃掉 Twelve Data 的額度。
+          if (!live.fetchedAt || Date.now() - live.fetchedAt > QUOTE_FRESH_MS) refreshQuotes();
+          else render();
+        });
     }).catch(function () { offline(); });
   }
 
@@ -1015,7 +1019,9 @@
     var app = document.getElementById("app");
 
     var reloadBtn = document.getElementById("btn-reload-db");
-    if (reloadBtn) reloadBtn.addEventListener("click", function () { loadFromDb(false); });
+    if (reloadBtn) reloadBtn.addEventListener("click", function () {
+      loadFromDb(false).then(function () { return loadQuotes(); });
+    });
 
     app.querySelectorAll("[data-sort]").forEach(function (b) {
       b.addEventListener("click", function () { ui.sort = b.getAttribute("data-sort"); render(); });
