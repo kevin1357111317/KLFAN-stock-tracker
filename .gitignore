@@ -1,0 +1,7 @@
+# build.py 的產物，改 app.js / app.css 後重跑即可重新生成
+klfan_app.html
+klfan_app_full.html
+
+__pycache__/
+*.pyc
+.DS_Store
