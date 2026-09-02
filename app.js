@@ -67,13 +67,27 @@
       lastRaw = "payload type=" + (typeof p) + " keys=" + (p && typeof p === "object" ? Object.keys(p).join(",") : "-");
       return null;
     }
-    var m = text.match(/<untrusted-data-[^>]*>([\s\S]*?)<\/untrusted-data-[^>]*>/);
-    var body = (m ? m[1] : text).trim();
-    try { return JSON.parse(body); } catch (e) {
-      lastRaw = "len=" + text.length + (m ? " (已取出區塊 " + body.length + ")" : " (找不到資料區塊)") +
-        " 開頭:" + body.slice(0, 80) + " 結尾:" + body.slice(-40);
-      return null;
+    // 這個信封的前言句子裡也會出現一組同名的開標籤
+    // （「…within the below <untrusted-data-UUID> boundaries.」），
+    // 所以不能從「第一個」開標籤抓 —— 那樣會把 "boundaries. <untrusted-data-…>"
+    // 一起吃進去，JSON 直接解不開。要取的是結束標籤前「最後一個」開標籤。
+    var body = text;
+    var close = text.indexOf("</untrusted-data");
+    if (close >= 0) {
+      var open = text.lastIndexOf("<untrusted-data-", close);
+      var gt = open >= 0 ? text.indexOf(">", open) : -1;
+      body = (gt >= 0 && gt < close) ? text.slice(gt + 1, close) : text.slice(0, close);
     }
+    body = body.trim();
+    try { return JSON.parse(body); } catch (e) {}
+    // 信封格式再變的話，退一步從第一個 [ 取到最後一個 ]；execute_sql 一定回陣列。
+    var a = body.indexOf("["), b = body.lastIndexOf("]");
+    if (a >= 0 && b > a) {
+      try { return JSON.parse(body.slice(a, b + 1)); } catch (e2) {}
+    }
+    lastRaw = "len=" + text.length + " 取出 " + body.length +
+      " 開頭:" + body.slice(0, 60) + " 結尾:" + body.slice(-30);
+    return null;
   }
 
   function sql(query) {

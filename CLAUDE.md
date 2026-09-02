@@ -161,7 +161,14 @@ capabilities: {
    而不是讓頁面發 —— CSP 管的是瀏覽器。
 2. **連接器回應有大小上限。** 一次回 135KB 會被截斷 → JSON 解析失敗。
    交易資料因此改成每頁 400 筆分頁載入（每頁約 26KB）。
-3. 頁面自己不能存資料，所有寫入都要走 Supabase。
+3. **一次只發一個 `execute_sql`。** 帳本與報價現在都走 Supabase，`connect()` 是
+   排隊執行的（帳本 → 報價 → 更新），不要改成並行。
+4. **`<untrusted-data-…>` 信封不能用「第一個」開標籤去抓。** 前言那句話
+   （「…within the below `<untrusted-data-UUID>` boundaries.」）本身就含有一組
+   同名開標籤，從第一個抓會把 `boundaries. <untrusted-data-…>` 一起吃進去，
+   JSON 解不開、整頁變成 0。要取結束標籤前的**最後一個**開標籤 —— 見
+   `parseSqlRows()`，另外備有「從第一個 `[` 取到最後一個 `]`」的退路。
+5. 頁面自己不能存資料，所有寫入都要走 Supabase。
 
 ---
 
