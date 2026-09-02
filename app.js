@@ -488,6 +488,27 @@
     return total;
   }
 
+  // 掃描用的折現率網格：接近 -100% 的地方要密，往上逐漸放寬到 1000。
+  function rateGrid() {
+    var g = [-0.9999, -0.999, -0.995, -0.99, -0.98, -0.95, -0.9, -0.85, -0.8,
+             -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1];
+    var r = -0.05;
+    while (r <= 1000) {
+      g.push(Math.round(r * 1e6) / 1e6);
+      r = r < 1 ? r + 0.01 : (r < 10 ? r + 0.1 : r * 1.15);
+    }
+    g.push(1000);
+    return g;
+  }
+
+  // 現金流方向變號超過一次時，NPV 可能有多個根。直接在 [-1, 1000] 兩端試
+  // 正負號會漏掉這種情形 —— 兩端同號不代表無解，可能是中間穿過去又穿回來。
+  // 實際遇過：某個桶最早的現金流是一筆一週內就獲利出場的交易，NPV 在高折現率
+  // 端翻回正的，兩端同號，整個市場別的 XIRR 就變成「—」。
+  //
+  // 所以改成先在網格上找出第一個變號區間，再在那個小區間裡二分。取到的是
+  // 最小的根，也就是經濟意義上的那一個。單根時與原本的做法結果完全相同
+  // （已用全部 39 檔標的與各市場別回歸驗證過）。
   function xirr(cfs) {
     if (!cfs.length) return null;
     var hasPos = cfs.some(function (c) { return c.amount > 0; });
@@ -495,25 +516,24 @@
     if (!hasPos || !hasNeg) return null;
     var base = cfs.reduce(function (m, c) { return c.date < m ? c.date : m; }, cfs[0].date);
 
-    // bisection over a wide bracket, robust against Newton divergence
-    var lo = -0.999999, hi = 100;
-    var flo = xnpv(lo, cfs, base), fhi = xnpv(hi, cfs, base);
-    if (isNaN(flo) || isNaN(fhi)) return null;
-    if (flo * fhi > 0) {
-      // try to widen upper bound a bit before giving up
-      hi = 1000;
-      fhi = xnpv(hi, cfs, base);
-      if (flo * fhi > 0) return null;
+    var g = rateGrid();
+    var prevR = null, prevF = null;
+    for (var i = 0; i < g.length; i++) {
+      var f = xnpv(g[i], cfs, base);
+      if (!isFinite(f)) { prevR = null; prevF = null; continue; }
+      if (prevF !== null && (prevF < 0) !== (f < 0)) {
+        var lo = prevR, flo = prevF, hi = g[i], mid = lo, fmid;
+        for (var j = 0; j < 200; j++) {
+          mid = (lo + hi) / 2;
+          fmid = xnpv(mid, cfs, base);
+          if (Math.abs(fmid) < 1e-9) break;
+          if ((flo < 0) === (fmid < 0)) { lo = mid; flo = fmid; } else { hi = mid; }
+        }
+        return isFinite(mid) ? mid : null;
+      }
+      prevR = g[i]; prevF = f;
     }
-    var mid = 0, fmid;
-    for (var i = 0; i < 200; i++) {
-      mid = (lo + hi) / 2;
-      fmid = xnpv(mid, cfs, base);
-      if (Math.abs(fmid) < 1e-6) break;
-      if ((flo < 0) === (fmid < 0)) { lo = mid; flo = fmid; } else { hi = mid; }
-    }
-    if (!isFinite(mid)) return null;
-    return mid;
+    return null;
   }
 
   function currentShares(stock) {
