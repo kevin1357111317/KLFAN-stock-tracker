@@ -92,6 +92,91 @@ Deno.serve(async (req: Request) => {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
+  let mode: string | null = null;
+  try {
+    const body = await req.json();
+    if (body && typeof body.mode === "string") mode = body.mode;
+  } catch { /* 空 body 是正常的 */ }
+
+  // 只查台股官方名稱，不寫任何東西、也不碰行情商額度。
+  // 來源是證交所的公開資料（STOCK_DAY_ALL 每一列都有 Code 與 Name），
+  // 用來把 klfan_stocks.display 對回官方簡稱 —— 原本的名稱是從 Google
+  // 試算表匯入的手打值，不保證與官方一致。
+  //
+  // 這一段放在 Edge Function 而不是本機，是因為開發沙箱的網路政策擋掉了
+  // twse.com.tw；Supabase 這邊連得出去。
+  if (mode === "twse-names") {
+    const { data: all, error: allErr } = await db.from("klfan_stocks").select("key,symbol,display");
+    if (allErr) return json({ error: "stocks_unavailable", detail: allErr.message }, 500);
+    const tw = (all ?? [])
+      .map((r) => ({ key: r.key, display: r.display, ...splitSymbol(String(r.symbol ?? "").trim()) }))
+      .filter((r) => (r.venue === "TPE" || r.venue === "TWO") && SAFE_CODE.test(r.code));
+
+    const map: Record<string, string> = {};
+    const sources: Record<string, number | string> = {};
+
+    // 先打每日收盤行情：JSON、一次到位、快。涵蓋絕大多數上市普通股與 ETF。
+    try {
+      const res = await fetch("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", {
+        headers: { Accept: "application/json" },
+      });
+      if (!res.ok) sources["stock_day_all"] = `http_${res.status}`;
+      else {
+        const rows = await res.json();
+        let n = 0;
+        if (Array.isArray(rows)) {
+          for (const r of rows) {
+            const c = String(r?.Code ?? "").trim();
+            const nm = String(r?.Name ?? "").trim();
+            if (c && nm) { map[c] = nm; n++; }
+          }
+        }
+        sources["stock_day_all"] = n;
+      }
+    } catch {
+      sources["stock_day_all"] = "unreachable";
+    }
+
+    // 每日收盤行情漏掉債券 ETF 與上櫃股，缺的再逐檔去證交所的
+    // 「有價證券代號及名稱」查。用單檔端點而不是整份總表 —— 總表含權證、
+    // 好幾 MB，會直接逾時。回應是 Big5 編碼的 HTML 表格。
+    const missing = tw.filter((r) => !(r.code in map));
+    if (missing.length > 0) {
+      let found = 0;
+      await mapLimit(missing, 3, async (r) => {
+        try {
+          const res = await fetch(
+            `https://isin.twse.com.tw/isin/single_main.jsp?owncode=${encodeURIComponent(r.code)}`,
+          );
+          if (!res.ok) return;
+          const html = new TextDecoder("big5").decode(await res.arrayBuffer());
+          const cells: string[] = [];
+          const re = /<td[^>]*>([\s\S]*?)<\/td>/g;
+          let m: RegExpExecArray | null;
+          while ((m = re.exec(html)) !== null) {
+            cells.push(m[1].replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim());
+          }
+          // 代號那一格的下一格就是名稱
+          const i = cells.indexOf(r.code);
+          if (i >= 0 && cells[i + 1]) { map[r.code] = cells[i + 1]; found++; }
+        } catch { /* 查不到就留 null，由呼叫端決定怎麼辦 */ }
+      });
+      sources["isin_single"] = `${found}/${missing.length}`;
+    }
+
+    if (Object.keys(map).length === 0) return json({ error: "twse_unreachable", sources }, 502);
+
+    return json({
+      mode: "twse-names",
+      sources,
+      listed: Object.keys(map).length,
+      names: tw.map((r) => ({
+        key: r.key, code: r.code, current: r.display,
+        official: map[r.code] ?? null,
+      })),
+    });
+  }
+
   // klfan_live_symbols 只列出仍持有的標的。已出清的持股為 0、市值恆為 0，
   // 抓它的價格不會改變畫面上任何數字，卻會吃掉 Twelve Data 每分鐘 8 credits
   // 的額度（一檔算一個）—— 39 檔全抓會直接 429。

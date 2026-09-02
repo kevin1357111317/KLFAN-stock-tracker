@@ -223,6 +223,21 @@ Twelve Data 帶 `country=United States`，避免 `DRAM` 抓到同名的歐洲 ET
 
 只要 `klfan_stocks.symbol` 填對前綴就會自動被抓，**不再需要去維護任何試算表**。
 
+### 台股名稱來自證交所
+
+`klfan_stocks.display` 原本是從 Google 試算表匯入的手打值。2026/09/02 已用
+`select klfan_twse_names()` 對過證交所並同步（改了兩處：`00679B` 元大美債20 →
+**元大美債20年**、`00909` 國泰數位支付 → **國泰數位支付服務**；其餘 18 檔本來就一致，
+代號前綴也一併從名稱裡拿掉了）。
+
+那個函式是唯讀的，只回傳「現在的名稱 vs 官方名稱」讓你比對，要不要套用是另一道
+`update`（SQL 附在 `supabase/migrations/004_twse_names.sql` 的註解裡）。
+
+取名稱的兩個來源，順序不能反過來：
+1. `openapi.twse.com.tw` 每日收盤行情 —— JSON、快，但**漏掉債券 ETF 與上櫃股**
+2. 缺的再逐檔查 `isin.twse.com.tw/isin/single_main.jsp?owncode=<代號>`
+   —— **不要改用整份總表**（`C_public.jsp`），那份含權證、好幾 MB，會直接逾時
+
 ---
 
 ## 已知的坑
