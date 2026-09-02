@@ -19,6 +19,7 @@
   var DB_TOOL = "execute_sql";
   var DB_PROJECT = "gbxsnwqbjmgfikpblyot";
   var CACHE_KEY = "klfan_db_cache_v1";
+  var QUOTE_CACHE_KEY = "klfan_quote_cache_v1";
 
   var db = {
     available: null,  // null = resolving, false = no connector path
@@ -103,7 +104,9 @@
   // The whole ledger in one response was too big to come back intact, so the
   // load is paged and the FX conversion is done in SQL — each transaction
   // arrives with its TWD value already computed at that day's rate.
-  var PAGE = 400;
+  // 實測：400 筆約 35KB、800 筆約 70KB，全部 1,480 筆是 128KB。
+  // 連接器約 135KB 會截斷，所以 800 是「往返次數減半又留有餘裕」的折衷。
+  var PAGE = 800;
 
   var STOCKS_SQL =
     "select coalesce(json_agg(json_build_array(key,display,market,currency,symbol,manual_price) order by key),'[]'::json) as d from klfan_stocks";
@@ -124,7 +127,9 @@
     return rows && rows[0] ? rows[0].d : null;
   }
 
-  function hydrateStocks(list) {
+  // 回傳新物件而不是直接寫進 state —— 交易要分頁讀，中途就換上去的話
+  // 畫面會先看到「有標的、零筆交易」，所有數字瞬間歸零再跳回來。
+  function buildStocks(list) {
     var stocks = {};
     (list || []).forEach(function (r) {
       stocks[r[0]] = {
@@ -133,18 +138,28 @@
         transactions: []
       };
     });
-    state.stocks = stocks;
+    return stocks;
   }
 
-  function hydrateTxPage(list) {
+  function applyTxPage(stocks, list) {
     (list || []).forEach(function (r) {
-      var s = state.stocks[r[1]];
+      var s = stocks[r[1]];
       if (!s) return;
       s.transactions.push({
         id: r[0], date: r[2], amount: Number(r[3]), shares: Number(r[4]),
         bank: r[5] || "", kind: r[6], note: r[7] || "", twd: Number(r[8])
       });
     });
+  }
+
+  function hydrateFromCache(cached) {
+    if (!cached || !cached.data) return false;
+    var stocks = buildStocks(cached.data.stocks);
+    applyTxPage(stocks, cached.data.txs);
+    state.stocks = stocks;
+    db.fromCache = true;
+    db.loadedAt = cached.at;
+    return true;
   }
 
   function cacheWrite(data) {
@@ -191,16 +206,17 @@
     db.loading = true;
     db.progress = 0;
     render();
+    var staged = null;
     return sql(STOCKS_SQL).then(function (rows) {
       var list = firstCell(rows);
       if (!list) throw { code: "bad_response", message: "查無標的" };
-      hydrateStocks(list);
-      render();
-      // page through the ledger; each page is a small, safely-sized response
+      staged = buildStocks(list);
+      // 分頁讀，讀進 staged；畫面上仍是舊資料（快取或上次載入的），
+      // 全部到齊才換上去。
       function nextPage(offset) {
         return sql(txPageSql(offset)).then(function (r2) {
           var page = firstCell(r2) || [];
-          hydrateTxPage(page);
+          applyTxPage(staged, page);
           db.progress = offset + page.length;
           render();
           if (page.length === PAGE) return nextPage(offset + PAGE);
@@ -208,6 +224,7 @@
       }
       return nextPage(0);
     }).then(function () {
+      state.stocks = staged;
       cacheWrite(exportForCache());
       db.status = null;
       db.loading = false;
@@ -222,13 +239,7 @@
       }
       db.loading = false;
       db.status = { code: code, message: dbErrorCopy(code, err && err.message) };
-      var cached = cacheRead();
-      if (cached && cached.data && !Object.keys(state.stocks).length) {
-        hydrateStocks(cached.data.stocks);
-        hydrateTxPage(cached.data.txs);
-        db.fromCache = true;
-        db.loadedAt = cached.at;
-      }
+      if (!Object.keys(state.stocks).length) hydrateFromCache(cacheRead());
       render();
     });
   }
@@ -280,9 +291,9 @@
     "extract(epoch from updated_at)*1000) order by symbol),'[]'::json) as d from klfan_quotes";
   var REFRESH_SQL = "select refresh_klfan_quotes() as d";
 
-  // Re-opening the page refreshes, but a reload loop shouldn't burn API
-  // credits — anything fetched within this window is treated as current.
-  var QUOTE_FRESH_MS = 60000;
+  // 開啟時更新，但這個時間內抓過的就直接沿用 —— 反覆重開不該每次都去
+  // 打一輪 Fugle / Twelve Data（也吃額度）。要最新的按「重新整理」。
+  var QUOTE_FRESH_MS = 10 * 60 * 1000;
 
   var live = {
     available: null,   // null = still resolving, false = no connector path
@@ -295,6 +306,30 @@
   };
   // mcpCap is declared once, up in the database section — both the ledger and
   // the quote feed share the same resolved capability.
+
+  function quoteCacheWrite() {
+    try {
+      localStorage.setItem(QUOTE_CACHE_KEY, JSON.stringify({
+        prices: live.prices, fx: live.fx, sources: live.sources, fetchedAt: live.fetchedAt
+      }));
+    } catch (e) {}
+  }
+
+  // 開啟時先把上次的報價畫出來，不必等資料庫來回一趟才看到價格。
+  function quoteCacheRead() {
+    try {
+      var raw = localStorage.getItem(QUOTE_CACHE_KEY);
+      if (!raw) return false;
+      var c = JSON.parse(raw);
+      if (!c || !c.prices) return false;
+      live.prices = c.prices;
+      live.fx = typeof c.fx === "number" ? c.fx : null;
+      live.sources = c.sources || null;
+      live.fetchedAt = c.fetchedAt || null;
+      live.available = true;
+      return true;
+    } catch (e) { return false; }
+  }
 
   function applyQuoteRows(list) {
     // 各來源的 quoted_at 意義不同（台股是今天收盤，美股是前一交易日收盤），
@@ -313,6 +348,7 @@
     live.fetchedAt = newest || Date.now();
     live.status = null;
     live.available = true;
+    quoteCacheWrite();
   }
 
   // Each code gets its own fix — never one generic "something went wrong".
@@ -377,29 +413,31 @@
       db.available = false;
       db.loading = false;
       db.status = { code: "not_granted", message: "這個畫面連不到連接器，資料庫與報價都無法載入" };
-      var cached = cacheRead();
-      if (cached && cached.data) {
-        hydrateStocks(cached.data.stocks);
-        hydrateTxPage(cached.data.txs);
-        db.fromCache = true;
-        db.loadedAt = cached.at;
-      }
+      hydrateFromCache(cacheRead());
       render();
     }
     if (typeof claude === "undefined" || !claude || !claude.use) { offline(); return; }
     claude.use("mcp").then(function (m) {
       if (!m) { offline(); return; }
       mcpCap = m;
-      live.available = null;
       db.available = true;
+
+      // 先把上次的快照畫出來。整份帳本要 3 次來回（標的 + 2 頁交易），
+      // 每次都等於一趟連接器往返 —— 空等那幾秒才是「開啟很慢」的主因。
+      // 快取先上，數字立刻在，後面讀到的新資料再一次換掉。
+      var seeded = hydrateFromCache(cacheRead());
+      if (quoteCacheRead()) seeded = true;
+      if (!seeded) live.available = null;
+      render();
+
       // 一次只發一個 execute_sql。帳本與報價現在都走 Supabase，同時發出去
       // 會讓回應對不上請求，解析直接失敗（報價原本走 Google Drive，是不同的
       // 連接器，所以以前不會有這個問題）。
       loadFromDb(false)
         .then(function () { return loadQuotes(); })
         .then(function () {
-          // 開啟時更新一次 —— 但若上一次抓取還很新就不重抓，避免重整頁面
-          // 就白白吃掉 Twelve Data 的額度。
+          // 開啟時更新一次 —— 但若上一次抓取還夠新就不重抓。抓一次要等
+          // Fugle 四檔加 Twelve Data 兩次往返，重開頁面不該每次都付這個成本。
           if (!live.fetchedAt || Date.now() - live.fetchedAt > QUOTE_FRESH_MS) refreshQuotes();
           else render();
         });
