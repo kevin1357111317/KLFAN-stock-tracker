@@ -91,13 +91,26 @@
     return null;
   }
 
-  function sql(query) {
+  // 每一次 execute_sql 都是一趟「瀏覽器 → claude.ai → MCP → Supabase」往返。
+  // Postgres 端實測只要約 12ms，所以慢的是往返本身 —— 記下來才知道該砍哪裡。
+  var perf = { marks: [], since: null };
+  function perfReset() { perf.marks = []; perf.since = Date.now(); }
+  function perfTotal() {
+    return perf.marks.reduce(function (a, m) { return a + m.ms; }, 0);
+  }
+
+  function sql(query, label) {
     if (!mcpCap) return Promise.reject({ code: "not_granted", message: "no connector" });
+    var t0 = Date.now();
     return mcpCap.callTool(DB_SERVER, DB_TOOL, { project_id: DB_PROJECT, query: query }, { cache: false })
       .then(function (r) {
+        if (label) perf.marks.push({ label: label, ms: Date.now() - t0 });
         var rows = parseSqlRows(r);
         if (rows === null) throw { code: "bad_response", message: "資料庫回應看不懂" + (lastRaw ? "（" + lastRaw + "）" : "") };
         return rows;
+      }, function (e) {
+        if (label) perf.marks.push({ label: label, ms: Date.now() - t0, failed: true });
+        throw e;
       });
   }
 
@@ -108,8 +121,16 @@
   // 連接器約 135KB 會截斷，所以 800 是「往返次數減半又留有餘裕」的折衷。
   var PAGE = 800;
 
-  var STOCKS_SQL =
-    "select coalesce(json_agg(json_build_array(key,display,market,currency,symbol,manual_price) order by key),'[]'::json) as d from klfan_stocks";
+  var STOCKS_JSON =
+    "coalesce(json_agg(json_build_array(key,display,market,currency,symbol,manual_price) order by key),'[]'::json)";
+  var QUOTES_JSON =
+    "coalesce(json_agg(json_build_array(symbol,price,currency,source,quoted_at," +
+    "extract(epoch from updated_at)*1000) order by symbol),'[]'::json)";
+
+  // 標的 1.9KB、報價 0.8KB，兩份都很小又一定一起要 —— 合併成一次往返。
+  var INIT_SQL =
+    "select (select " + STOCKS_JSON + " from klfan_stocks) as s," +
+    " (select " + QUOTES_JSON + " from klfan_quotes) as q";
 
   function txPageSql(offset) {
     return "select coalesce(json_agg(json_build_array(id,stock_key,d,a,q,b,k,n,tw) order by id),'[]'::json) as d from (" +
@@ -207,14 +228,16 @@
     db.progress = 0;
     render();
     var staged = null;
-    return sql(STOCKS_SQL).then(function (rows) {
-      var list = firstCell(rows);
-      if (!list) throw { code: "bad_response", message: "查無標的" };
-      staged = buildStocks(list);
+    perfReset();
+    return sql(INIT_SQL, "標的+報價").then(function (rows) {
+      var row = rows && rows[0];
+      if (!row || !row.s) throw { code: "bad_response", message: "查無標的" };
+      staged = buildStocks(row.s);
+      applyQuoteRows(row.q);   // 報價順道一起回來，省一趟往返
       // 分頁讀，讀進 staged；畫面上仍是舊資料（快取或上次載入的），
       // 全部到齊才換上去。
       function nextPage(offset) {
-        return sql(txPageSql(offset)).then(function (r2) {
+        return sql(txPageSql(offset), "交易 " + (offset + 1) + "–").then(function (r2) {
           var page = firstCell(r2) || [];
           applyTxPage(staged, page);
           db.progress = offset + page.length;
@@ -286,9 +309,7 @@
      Only currently-held symbols are quoted: an exited position is worth 0
      whatever the price, and Twelve Data's free tier bills per symbol. */
 
-  var QUOTES_SQL =
-    "select coalesce(json_agg(json_build_array(symbol,price,currency,source,quoted_at," +
-    "extract(epoch from updated_at)*1000) order by symbol),'[]'::json) as d from klfan_quotes";
+  var QUOTES_SQL = "select " + QUOTES_JSON + " as d from klfan_quotes";
   var REFRESH_SQL = "select refresh_klfan_quotes() as d";
 
   // 開啟時更新，但這個時間內抓過的就直接沿用 —— 反覆重開不該每次都去
@@ -401,7 +422,7 @@
   // Read whatever the last refresh left in the table. Cheap, and it means a
   // failed refresh still shows the previous prices instead of nothing.
   function loadQuotes() {
-    return sql(QUOTES_SQL)
+    return sql(QUOTES_SQL, "報價")
       .then(function (rows) { applyQuoteRows(firstCell(rows)); })
       .catch(function (e) { handleQuoteError(e); });
   }
@@ -433,14 +454,13 @@
       // 一次只發一個 execute_sql。帳本與報價現在都走 Supabase，同時發出去
       // 會讓回應對不上請求，解析直接失敗（報價原本走 Google Drive，是不同的
       // 連接器，所以以前不會有這個問題）。
-      loadFromDb(false)
-        .then(function () { return loadQuotes(); })
-        .then(function () {
-          // 開啟時更新一次 —— 但若上一次抓取還夠新就不重抓。抓一次要等
-          // Fugle 四檔加 Twelve Data 兩次往返，重開頁面不該每次都付這個成本。
-          if (!live.fetchedAt || Date.now() - live.fetchedAt > QUOTE_FRESH_MS) refreshQuotes();
-          else render();
-        });
+      loadFromDb(false).then(function () {
+        // 開啟時更新一次 —— 但若上一次抓取還夠新就不重抓。抓一次要等
+        // Fugle 四檔加 Twelve Data 兩次往返（實測約 2.1 秒），重開頁面
+        // 不該每次都付這個成本。
+        if (!live.fetchedAt || Date.now() - live.fetchedAt > QUOTE_FRESH_MS) refreshQuotes();
+        else render();
+      });
     }).catch(function () { offline(); });
   }
 
@@ -450,7 +470,7 @@
     if (!mcpCap || live.busy) return;
     live.busy = true;
     render();
-    sql(REFRESH_SQL)
+    sql(REFRESH_SQL, "報價更新")
       .then(function (rows) {
         var r = firstCell(rows) || {};
         return loadQuotes().then(function () {
@@ -797,8 +817,20 @@
         "在這裡新增或刪除會直接寫進資料庫，但不會回寫 Google Sheet。" +
         "報價由 Supabase Edge Function 抓取後存進 klfan_quotes：" +
         "台股來自 Fugle，美股與匯率來自 Twelve Data，只抓仍持有的標的。</p>" +
+        renderPerf() +
       "</footer>"
     );
+  }
+
+  // 每一趟往返各花多久。Postgres 端只要約 12ms，所以這裡看到的幾乎都是
+  // 連接器來回的時間 —— 要再快就只能減少往返次數或縮小回應。
+  function renderPerf() {
+    if (!perf.marks.length) return "";
+    var parts = perf.marks.map(function (m) {
+      return escapeHtml(m.label) + " " + (m.ms / 1000).toFixed(1) + "s" + (m.failed ? "(失敗)" : "");
+    });
+    return "<p>本次載入：" + parts.join(" · ") +
+      "｜合計 " + (perfTotal() / 1000).toFixed(1) + "s</p>";
   }
 
   function renderDbBar() {
@@ -1072,7 +1104,7 @@
 
     var reloadBtn = document.getElementById("btn-reload-db");
     if (reloadBtn) reloadBtn.addEventListener("click", function () {
-      loadFromDb(false).then(function () { return loadQuotes(); });
+      loadFromDb(false);
     });
 
     app.querySelectorAll("[data-sort]").forEach(function (b) {
