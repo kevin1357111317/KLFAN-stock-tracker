@@ -677,6 +677,43 @@
     return sh * price;
   }
 
+  /* ---------- 已實現／未實現拆分 ----------
+     用**加權平均成本法**（台灣券商慣例）：賣出時以當下的平均成本結轉，
+     剩下的成本留在部位裡。改用 FIFO 會得到不同的拆分，但兩者的
+     「已實現 + 未實現」總和一定相同 —— 這也是下面測試在驗的不變條件。
+
+     amountOf 決定用哪個幣別：個股卡片用原幣（t.amount），
+     台幣彙總用交易當日匯率換算好的 t.twd。 */
+  function splitCost(stock, amountOf) {
+    var shares = 0, cost = 0, realized = 0;
+    var txs = stock.transactions.slice().sort(function (a, b) {
+      if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+      return (a.id || 0) - (b.id || 0);
+    });
+    txs.forEach(function (t) {
+      var a = amountOf(t);
+      var q = t.shares || 0;
+      // 股息與純現金調整沒有股數異動，直接算已實現
+      if (t.kind === "dividend" || Math.abs(q) < 0.0000001) { realized += a; return; }
+      if (q > 0) { cost += -a; shares += q; return; }   // 買進：amount 是負的現金流
+      var sold = Math.min(-q, shares);
+      var avg = shares > 0.0000001 ? cost / shares : 0;
+      var out = avg * sold;
+      realized += a - out;                              // 賣出收入 − 結轉成本
+      cost -= out;
+      shares -= sold;
+      // 出清後成本應歸零；浮點殘值併入已實現，免得未實現掛著一個假數字
+      if (shares <= 0.0000001) { realized += cost; cost = 0; shares = 0; }
+    });
+    return { realized: realized, cost: cost, shares: shares };
+  }
+
+  // 未實現 = 目前市值 − 尚未結轉的成本
+  function realizedPL(stock) { return splitCost(stock, function (t) { return t.amount; }).realized; }
+  function unrealizedPL(stock) {
+    return currentValue(stock) - splitCost(stock, function (t) { return t.amount; }).cost;
+  }
+
   function totalPL(stock) {
     var sumAll = 0;
     stock.transactions.forEach(function (t) { sumAll += t.amount; });
@@ -719,7 +756,7 @@
   }
 
   function blankBucket() {
-    return { value: 0, invested: 0, pl: 0, div: 0, cfs: [], holdings: 0, tickers: 0 };
+    return { value: 0, invested: 0, pl: 0, realized: 0, unrealized: 0, div: 0, cfs: [], holdings: 0, tickers: 0 };
   }
 
   function addToBucket(b, s) {
@@ -733,6 +770,11 @@
       if (t.kind === "dividend") div += twd;
       b.cfs.push({ date: t.date, amount: twd });
     });
+    // 台幣拆分：現金流用交易當日匯率（txTwd），市值用即時匯率 —— 與 pl 一致
+    var sp = splitCost(s, function (t) { return txTwd(t, s); });
+    b.realized += sp.realized;
+    b.unrealized += cvTwd - sp.cost;
+
     b.value += cvTwd;
     b.invested += ni;
     b.pl += plCash + cvTwd;
@@ -948,6 +990,7 @@
   }
 
   // 台股 / 美股 / 合計 breakdown — mirrors the 績效統計 block in 股票總表
+  // 已實現／未實現用加權平均成本法拆分；兩者相加必然等於累計損益。
   function renderMarketTable(m) {
     var cols = ["台股", "美股", "合計"];
     function row(label, pick, cls) {
@@ -967,6 +1010,8 @@
         row("累計淨投入", function (b) { return fmtMoney(b.invested, "TWD"); }) +
         row("目前市值", function (b) { return fmtMoney(b.value, "TWD"); }) +
         row("累計股息", function (b) { return fmtMoney(b.div, "TWD"); }) +
+        row("已實現損益", function (b) { return fmtMoney(b.realized, "TWD", { showPlus: true }); }, function (b) { return plClass(b.realized); }) +
+        row("未實現損益", function (b) { return fmtMoney(b.unrealized, "TWD", { showPlus: true }); }, function (b) { return plClass(b.unrealized); }) +
         row("累計損益", function (b) { return fmtMoney(b.pl, "TWD", { showPlus: true }); }, function (b) { return plClass(b.pl); }) +
         row("總報酬率", function (b) { return fmtPct(b.returnPct, { showPlus: true }); }, function (b) { return plClass(b.returnPct); }) +
         row("年化報酬 XIRR", function (b) { return fmtPct(b.xirr, { showPlus: true }); }, function (b) { return plClass(b.xirr); }) +
@@ -1062,6 +1107,8 @@
         "</div>" +
 
         '<div class="factgrid">' +
+          fact("已實現損益", fmtMoney(realizedPL(s), s.currency, { showPlus: true }), plClass(realizedPL(s))) +
+          fact("未實現損益", fmtMoney(unrealizedPL(s), s.currency, { showPlus: true }), plClass(unrealizedPL(s))) +
           fact("累計股息", fmtMoney(div, s.currency), div > 0 ? "gain" : "") +
           fact("累計損益", fmtMoney(pl, s.currency, { showPlus: true }), plClass(pl)) +
           fact("投資期間", yrs === null ? "—" : yrs.toFixed(2) + " 年", "") +
