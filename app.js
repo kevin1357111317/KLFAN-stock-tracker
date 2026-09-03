@@ -678,33 +678,50 @@
   }
 
   /* ---------- 已實現／未實現拆分 ----------
-     用**加權平均成本法**（台灣券商慣例）：賣出時以當下的平均成本結轉，
-     剩下的成本留在部位裡。改用 FIFO 會得到不同的拆分，但兩者的
-     「已實現 + 未實現」總和一定相同 —— 這也是下面測試在驗的不變條件。
+     用**先進先出（FIFO）**：賣出時從最早買進的那批開始結轉成本。
+     這與美國券商的預設一致，對帳單比較對得起來。
+
+     改成加權平均會得到不同的拆分比例，但「已實現 + 未實現」的總和一定相同
+     —— 那是這段程式的不變條件，改動後務必重驗。
 
      amountOf 決定用哪個幣別：個股卡片用原幣（t.amount），
      台幣彙總用交易當日匯率換算好的 t.twd。 */
+  var EPS = 0.0000001;
+
   function splitCost(stock, amountOf) {
-    var shares = 0, cost = 0, realized = 0;
-    var txs = stock.transactions.slice().sort(function (a, b) {
-      if (a.date !== b.date) return a.date < b.date ? -1 : 1;
-      return (a.id || 0) - (b.id || 0);
+    var lots = [];        // 先進先出佇列：[{ qty, cost }]，最舊的在前
+    var realized = 0;
+    var txs = stock.transactions.slice().sort(function (x, y) {
+      if (x.date !== y.date) return x.date < y.date ? -1 : 1;
+      return (x.id || 0) - (y.id || 0);
     });
+
     txs.forEach(function (t) {
       var a = amountOf(t);
       var q = t.shares || 0;
       // 股息與純現金調整沒有股數異動，直接算已實現
-      if (t.kind === "dividend" || Math.abs(q) < 0.0000001) { realized += a; return; }
-      if (q > 0) { cost += -a; shares += q; return; }   // 買進：amount 是負的現金流
-      var sold = Math.min(-q, shares);
-      var avg = shares > 0.0000001 ? cost / shares : 0;
-      var out = avg * sold;
-      realized += a - out;                              // 賣出收入 − 結轉成本
-      cost -= out;
-      shares -= sold;
-      // 出清後成本應歸零；浮點殘值併入已實現，免得未實現掛著一個假數字
-      if (shares <= 0.0000001) { realized += cost; cost = 0; shares = 0; }
+      if (t.kind === "dividend" || Math.abs(q) < EPS) { realized += a; return; }
+      if (q > 0) { lots.push({ qty: q, cost: -a }); return; }  // 買進：amount 是負的現金流
+
+      var sold = -q, costOut = 0;
+      while (sold > EPS && lots.length) {
+        var lot = lots[0];
+        var take = Math.min(lot.qty, sold);
+        var unit = lot.qty > EPS ? lot.cost / lot.qty : 0;
+        costOut += unit * take;
+        lot.qty -= take;
+        lot.cost -= unit * take;
+        sold -= take;
+        if (lot.qty <= EPS) lots.shift();
+      }
+      realized += a - costOut;   // 賣出收入 − 結轉成本
     });
+
+    var shares = 0, cost = 0;
+    lots.forEach(function (l) { shares += l.qty; cost += l.cost; });
+    // 出清後成本應歸零；浮點殘值併入已實現，免得已出清的部位顯示一個
+    // 不存在的未實現數字
+    if (shares <= EPS) { realized += cost; cost = 0; shares = 0; }
     return { realized: realized, cost: cost, shares: shares };
   }
 
@@ -1002,7 +1019,7 @@
     }
     return (
       '<section class="card markettable">' +
-        '<div class="mt-head"><h3>台股 ／ 美股 分開看</h3><span class="mt-note">全部以台幣計算</span></div>' +
+        '<div class="mt-head"><h3>台股 ／ 美股 分開看</h3><span class="mt-note">全部以台幣計算 · 拆分採先進先出</span></div>' +
         '<div class="txtable-wrap"><table class="txtable mt">' +
         "<thead><tr><th>指標</th>" + cols.map(function (c) {
           return "<th class=\"num\">" + c + (c === "合計" ? "" : "（" + m[c].tickers + " 檔）") + "</th>";
